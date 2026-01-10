@@ -342,7 +342,7 @@ async def main():
         return
     
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(daily_report, "cron", hour=22, minute=32)
+    scheduler.add_job(daily_report, "cron", hour=17, minute=00)
     scheduler.start()
     
     try:
