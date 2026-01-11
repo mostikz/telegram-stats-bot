@@ -2,6 +2,8 @@ import logging
 import sqlite3
 import asyncio
 import os
+import signal
+import sys
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode, ChatType
@@ -18,6 +20,58 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Глобальные переменные для graceful shutdown
+bot_instance = None
+scheduler_instance = None
+is_shutting_down = False
+
+async def shutdown():
+    """Корректное завершение работы бота"""
+    global is_shutting_down
+    
+    if is_shutting_down:
+        return
+        
+    is_shutting_down = True
+    logger.info("Начинаем корректное завершение работы...")
+    
+    try:
+        # Останавливаем планировщик
+        if scheduler_instance and scheduler_instance.running:
+            scheduler_instance.shutdown(wait=False)
+            logger.info("Планировщик остановлен")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке планировщика: {e}")
+    
+    try:
+        # Закрываем сессию бота
+        if bot_instance:
+            await bot_instance.session.close()
+            logger.info("Сессия бота закрыта")
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии сессии бота: {e}")
+    
+    try:
+        # Закрываем соединение с базой данных
+        if 'conn' in globals():
+            conn.close()
+            logger.info("Соединение с БД закрыто")
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии БД: {e}")
+    
+    logger.info("Завершение работы завершено")
+    # Даем время на завершение операций
+    await asyncio.sleep(1)
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    logger.info(f"Получен сигнал {signum}, инициируем shutdown...")
+    asyncio.create_task(shutdown())
+
+# Регистрируем обработчики сигналов
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # Правильное создание бота для aiogram 3.7.0+
 bot = Bot(
@@ -274,6 +328,9 @@ async def get_sorted_members(chat_id, force_update=False):
 # Обработчик команды /status с проверкой типа чата
 @dp.message(Command("status"))
 async def handle_status(message: types.Message):
+    if is_shutting_down:
+        return
+        
     logger.info(f"Command /status received from {message.from_user.id} in chat {message.chat.id}")
     
     try:
@@ -336,12 +393,18 @@ async def handle_status(message: types.Message):
         
     except Exception as e:
         logger.error(f"Error in /status: {e}")
-        await message.reply("⚠️ Произошла ошибка при получении статистики.")
+        try:
+            await message.reply("⚠️ Произошла ошибка при получении статистики.")
+        except:
+            pass
 
 # Обработчик команды /top с проверкой типа чата
 @dp.message(Command("top"))
 async def handle_top(message: types.Message):
     """Показать топ участников по сообщениям"""
+    if is_shutting_down:
+        return
+        
     try:
         chat_id = message.chat.id
         chat_type = message.chat.type
@@ -400,12 +463,18 @@ async def handle_top(message: types.Message):
         
     except Exception as e:
         logger.error(f"Error in /top: {e}")
-        await message.reply("⚠️ Произошла ошибка при получении топа.")
+        try:
+            await message.reply("⚠️ Произошла ошибка при получении топа.")
+        except:
+            pass
 
 # Обработчик команды /reset_today с проверкой типа чата
 @dp.message(Command("reset_today"))
 async def handle_reset_today(message: types.Message):
     """Сбросить счетчики на сегодня (только для администраторов)"""
+    if is_shutting_down:
+        return
+        
     try:
         chat_type = message.chat.type
         
@@ -473,11 +542,17 @@ async def handle_reset_today(message: types.Message):
         
     except Exception as e:
         logger.error(f"Error in /reset_today: {e}")
-        await message.reply("⚠️ Произошла ошибка при сбросе счетчиков.")
+        try:
+            await message.reply("⚠️ Произошла ошибка при сбросе счетчиков.")
+        except:
+            pass
 
 # Обновленный обработчик всех сообщений
 @dp.message(F.text & ~F.text.startswith('/'))
 async def count_messages(message: types.Message):
+    if is_shutting_down:
+        return
+        
     if not message.from_user:
         return
 
@@ -539,6 +614,9 @@ async def count_messages(message: types.Message):
 # Обновленная функция daily_report
 async def daily_report():
     """Ежедневный отчет с учетом типов чатов"""
+    if is_shutting_down:
+        return
+        
     try:
         # Получаем список активных чатов из базы данных
         cursor.execute("""
@@ -630,18 +708,58 @@ async def daily_report():
     except Exception as e:
         logger.error(f"Error in daily_report: {e}")
 
-# Обновленная функция main
+async def auto_save_daily_stats():
+    """Автосохранение ежедневной статистики"""
+    if is_shutting_down:
+        return
+        
+    try:
+        cursor.execute("SELECT SUM(today) FROM messages")
+        total_today = cursor.fetchone()[0] or 0
+        
+        if total_today > 0:
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE today > 0")
+            active_today = cursor.fetchone()[0] or 0
+            
+            cursor.execute("SELECT user_id, today FROM messages WHERE today > 0 ORDER BY today DESC LIMIT 1")
+            top_user = cursor.fetchone()
+            
+            today_date = datetime.now().strftime('%Y-%m-%d')
+            cursor.execute("""
+                INSERT OR REPLACE INTO daily_stats 
+                (date, total_messages, active_users, top_user_id, top_user_count)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                today_date,
+                total_today,
+                active_today,
+                top_user[0] if top_user else None,
+                top_user[1] if top_user else 0
+            ))
+            conn.commit()
+            
+    except Exception as e:
+        logger.error(f"Error in auto_save_daily_stats: {e}")
+
 async def main():
+    global bot_instance, scheduler_instance
+    
+    # Сохраняем глобальные ссылки
+    bot_instance = bot
+    
     # Регистрируем команды для бота
-    await bot.set_my_commands([
-        types.BotCommand(command="status", description="📊 Статистика чата"),
-        types.BotCommand(command="top", description="🏆 Топ-10 участников"),
-        types.BotCommand(command="mystats", description="📈 Ваша статистика"),
-        types.BotCommand(command="yesterday", description="🗓️ Топ за вчера"),
-        types.BotCommand(command="weekly", description="📅 Статистика за неделю"),
-        types.BotCommand(command="reset_today", description="🔄 Сбросить счетчики"),
-        types.BotCommand(command="help", description="❓ Помощь по командам")
-    ])
+    try:
+        await bot.set_my_commands([
+            types.BotCommand(command="status", description="📊 Статистика чата"),
+            types.BotCommand(command="top", description="🏆 Топ-10 участников"),
+            types.BotCommand(command="mystats", description="📈 Ваша статистика"),
+            types.BotCommand(command="yesterday", description="🗓️ Топ за вчера"),
+            types.BotCommand(command="weekly", description="📅 Статистика за неделю"),
+            types.BotCommand(command="reset_today", description="🔄 Сбросить счетчики"),
+            types.BotCommand(command="help", description="❓ Помощь по командам")
+        ])
+    except Exception as e:
+        logger.error(f"Error setting bot commands: {e}")
     
     # Проверка токена перед запуском
     try:
@@ -655,33 +773,79 @@ async def main():
     
     # Настройка планировщика
     scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler_instance = scheduler
     
     # Ежедневный отчет в 23:59
-    scheduler.add_job(daily_report, "cron", hour=23, minute=59)
+    scheduler.add_job(daily_report, "cron", hour=23, minute=59, misfire_grace_time=60)
     
     # Автосохранение статистики каждый час
-    scheduler.add_job(auto_save_daily_stats, "cron", hour="*")
+    scheduler.add_job(auto_save_daily_stats, "cron", hour="*", misfire_grace_time=60)
     
     # Автоматический сброс счетчиков в полночь
-    scheduler.add_job(daily_report, "cron", hour=0, minute=1)
+    scheduler.add_job(daily_report, "cron", hour=0, minute=1, misfire_grace_time=60)
     
-    scheduler.start()
+    try:
+        scheduler.start()
+        logger.info("Планировщик запущен")
+    except Exception as e:
+        logger.error(f"Ошибка запуска планировщика: {e}")
     
     # Добавляем middleware для обработки ошибок
     @dp.errors()
     async def errors_handler(update: types.Update, exception: Exception):
-        logger.error(f"Update {update} caused error: {exception}")
+        if not is_shutting_down:
+            logger.error(f"Update {update} caused error: {exception}")
         return True
     
     try:
-        await dp.start_polling(bot, skip_updates=True)
+        logger.info("Бот запущен и готов к работе...")
+        await dp.start_polling(bot, skip_updates=True, handle_signals=False)
+    except asyncio.CancelledError:
+        logger.info("Получен сигнал отмены")
     except KeyboardInterrupt:
-        logger.info("Остановка бота...")
+        logger.info("Получен KeyboardInterrupt")
     except Exception as e:
         logger.error(f"Fatal error in polling: {e}")
     finally:
-        await bot.session.close()
-        conn.close()
+        logger.info("Запускаем процедуру завершения...")
+        await shutdown()
+        
+        # Дополнительная задержка для завершения всех операций
+        await asyncio.sleep(2)
+        
+        # Явно закрываем event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.stop()
+        
+        logger.info("Бот завершил работу")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Устанавливаем обработчик исключений
+    def handle_exception(loop, context):
+        msg = context.get("exception", context["message"])
+        logger.error(f"Caught exception in event loop: {msg}")
+        
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.set_exception_handler(handle_exception)
+    
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt, shutting down...")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+    finally:
+        # Закрываем все асинхронные задачи
+        tasks = asyncio.all_tasks(loop)
+        for task in tasks:
+            task.cancel()
+        
+        # Ждем завершения задач
+        if tasks:
+            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        
+        loop.close()
+        logger.info("Event loop закрыт")
+        sys.exit(0)
