@@ -12,7 +12,6 @@ from aiogram import F
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta
 import time
-from aiohttp import web
 
 API_TOKEN = os.getenv("BOT_TOKEN", "8280794130:AAE7VgMxB0mGR2adpu8FR3SBUS-YjKUydjI")
 
@@ -22,51 +21,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Глобальные переменные
+# Глобальные переменные для graceful shutdown
 bot_instance = None
 scheduler_instance = None
 is_shutting_down = False
-http_server = None
-
-# Получаем порт из переменной окружения (для Render.com)
-PORT = int(os.getenv("PORT", 8080))
-
-# Простой HTTP сервер для health checks
-async def health_check(request):
-    """Проверка здоровья сервиса"""
-    return web.Response(text="Bot is running", status=200)
-
-async def start_http_server():
-    """Запуск HTTP сервера для health checks"""
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    
-    logger.info(f"HTTP сервер запущен на порту {PORT}")
-    return runner
 
 async def shutdown():
     """Корректное завершение работы бота"""
-    global is_shutting_down, http_server
+    global is_shutting_down
     
     if is_shutting_down:
         return
         
     is_shutting_down = True
     logger.info("Начинаем корректное завершение работы...")
-    
-    try:
-        # Останавливаем HTTP сервер
-        if http_server:
-            await http_server.cleanup()
-            logger.info("HTTP сервер остановлен")
-    except Exception as e:
-        logger.error(f"Ошибка при остановке HTTP сервера: {e}")
     
     try:
         # Останавливаем планировщик
@@ -93,6 +61,7 @@ async def shutdown():
         logger.error(f"Ошибка при закрытии БД: {e}")
     
     logger.info("Завершение работы завершено")
+    # Даем время на завершение операций
     await asyncio.sleep(1)
 
 def signal_handler(signum, frame):
@@ -128,6 +97,29 @@ CREATE TABLE IF NOT EXISTS messages (
 )
 """)
 
+# Таблица для хранения ежедневной статистики
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS daily_stats (
+    date DATE PRIMARY KEY,
+    total_messages INTEGER DEFAULT 0,
+    active_users INTEGER DEFAULT 0,
+    top_user_id INTEGER,
+    top_user_count INTEGER
+)
+""")
+
+# Таблица для настроек чата
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id INTEGER PRIMARY KEY,
+    chat_type TEXT DEFAULT 'private',
+    auto_reset_time TEXT DEFAULT '23:59',
+    report_time TEXT DEFAULT '00:00',
+    timezone TEXT DEFAULT 'UTC',
+    is_active BOOLEAN DEFAULT 1
+)
+""")
+
 conn.commit()
 
 # Кэш для хранения данных о пользователях (оптимизация)
@@ -159,7 +151,15 @@ async def get_chat_members_safe(chat_id, chat_type):
                 return chat_members
             except Exception as e:
                 logger.error(f"Error getting group members: {e}")
-                return []
+                # Если не получается через администраторов, пробуем по-другому
+                try:
+                    # В некоторых группах можно получить участников напрямую
+                    chat = await bot.get_chat(chat_id)
+                    # Возвращаем пустой список - будем использовать данные из БД
+                    return []
+                except Exception as e2:
+                    logger.error(f"Error getting chat info: {e2}")
+                    return []
         
         elif chat_type == ChatType.CHANNEL:
             # Для каналов статистика не собирается
@@ -197,6 +197,7 @@ async def get_sorted_members(chat_id, force_update=False):
         
         if not chat_members:
             # Если не удалось получить участников, используем данные из базы для этого чата
+            logger.info(f"No members retrieved for chat {chat_id}, using DB data")
             cursor.execute("""
                 SELECT user_id, username, today, yesterday, total 
                 FROM messages 
@@ -206,7 +207,7 @@ async def get_sorted_members(chat_id, force_update=False):
                 )
                 ORDER BY today DESC, total DESC
                 LIMIT 50
-            """, (chat_id,))
+            """, (chat_id,))  # Исключаем ID самого чата если это группа
             
             rows = cursor.fetchall()
             members_with_stats = []
@@ -216,7 +217,7 @@ async def get_sorted_members(chat_id, force_update=False):
                 members_with_stats.append({
                     'user_id': user_id,
                     'username': username,
-                    'mention': username,
+                    'mention': username,  # В приватном чате упоминания не работают
                     'today': today,
                     'yesterday': yesterday,
                     'total': total,
@@ -352,7 +353,7 @@ async def handle_status(message: types.Message):
         # Для приватных чатов показываем упрощенную статистику
         if chat_type == ChatType.PRIVATE:
             if len(members_with_stats) > 0:
-                user_stats = members_with_stats[0]
+                user_stats = members_with_stats[0]  # Первый пользователь в списке
                 text = f"<b>📊 Ваша статистика</b>\n\n"
                 text += f"👤 <b>{user_stats['username']}</b>\n"
                 text += f"📅 <b>Сегодня:</b> {user_stats['today']} сообщений\n"
@@ -467,90 +468,6 @@ async def handle_top(message: types.Message):
         except:
             pass
 
-# Обработчик команды /mystats
-@dp.message(Command("mystats"))
-async def handle_mystats(message: types.Message):
-    """Показать статистику текущего пользователя"""
-    if is_shutting_down:
-        return
-        
-    try:
-        user_id = message.from_user.id
-        username = message.from_user.full_name
-        
-        # Получаем статистику из базы
-        cursor.execute("""
-            SELECT today, yesterday, total, first_seen 
-            FROM messages WHERE user_id=?
-        """, (user_id,))
-        
-        row = cursor.fetchone()
-        
-        if row:
-            today, yesterday, total, first_seen = row
-            # Обновляем имя пользователя если нужно
-            cursor.execute("UPDATE messages SET username=? WHERE user_id=?", 
-                         (username, user_id))
-            conn.commit()
-            
-            # Рассчитываем среднее в день
-            first_seen_date = datetime.fromisoformat(first_seen) if isinstance(first_seen, str) else first_seen
-            days_active = (datetime.now() - first_seen_date).days
-            avg_daily = round(total / max(days_active, 1), 1)
-            
-            text = f"<b>📊 Ваша статистика, {username}</b>\n\n"
-            text += f"📅 <b>Сегодня:</b> {today} сообщений\n"
-            text += f"🗓️ <b>Вчера:</b> {yesterday} сообщений\n"
-            text += f"📊 <b>Всего:</b> {total} сообщений\n"
-            text += f"📈 <b>Среднее в день:</b> {avg_daily} сообщений\n"
-            text += f"📅 <b>С нами с:</b> {first_seen_date.strftime('%d.%m.%Y')} ({days_active} дней)\n\n"
-            text += f"<i>Данные обновлены: {datetime.now().strftime('%H:%M:%S')}</i>"
-        else:
-            # Создаем новую запись
-            cursor.execute("""
-                INSERT INTO messages (user_id, username, today, total, first_seen)
-                VALUES (?, ?, 0, 0, CURRENT_TIMESTAMP)
-            """, (user_id, username))
-            conn.commit()
-            
-            text = f"<b>📊 Ваша статистика, {username}</b>\n\n"
-            text += "📊 Пока нет сообщений. Начните общаться!\n\n"
-            text += f"<i>Вы с нами с: {datetime.now().strftime('%d.%m.%Y')}</i>"
-        
-        await message.reply(text)
-        
-    except Exception as e:
-        logger.error(f"Error in /mystats: {e}")
-        try:
-            await message.reply("⚠️ Произошла ошибка при получении статистики.")
-        except:
-            pass
-
-# Обработчик команды /help
-@dp.message(Command("help", "start"))
-async def handle_help(message: types.Message):
-    """Показать справку по командам"""
-    if is_shutting_down:
-        return
-        
-    text = """
-<b>🤖 Бот статистики сообщений</b>
-
-<b>Основные команды:</b>
-/status - Полная статистика по чату
-/top - Топ-10 активных участников сегодня
-/mystats - Ваша личная статистика
-/help - Эта справка
-
-<b>Как это работает:</b>
-• Бот подсчитывает все текстовые сообщения
-• Статистика обновляется в реальном времени
-• Ежедневный автоматический сброс в полночь
-
-<i>Для работы в группах боту нужны права администратора</i>
-    """
-    await message.reply(text)
-
 # Обработчик команды /reset_today с проверкой типа чата
 @dp.message(Command("reset_today"))
 async def handle_reset_today(message: types.Message):
@@ -582,9 +499,36 @@ async def handle_reset_today(message: types.Message):
                 return
         except Exception as e:
             logger.error(f"Error checking admin rights: {e}")
-            await message.reply("⚠️ Не удалось проверить права администратора.")
-            return
+            # Если не удалось проверить права, разрешаем только создателю бота
+            me = await bot.get_me()
+            if message.from_user.id != me.id:
+                await message.reply("⚠️ Не удалось проверить права администратора.")
+                return
             
+        # Сохраняем данные за сегодня перед сбросом
+        cursor.execute("SELECT SUM(today) FROM messages")
+        total_today = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE today > 0")
+        active_today = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT user_id, today FROM messages WHERE today > 0 ORDER BY today DESC LIMIT 1")
+        top_user = cursor.fetchone()
+        
+        # Сохраняем в историю
+        today_date = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute("""
+            INSERT OR REPLACE INTO daily_stats 
+            (date, total_messages, active_users, top_user_id, top_user_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            today_date,
+            total_today,
+            active_today,
+            top_user[0] if top_user else None,
+            top_user[1] if top_user else 0
+        ))
+        
         # Сбрасываем счетчики на сегодня для всех участников
         cursor.execute("UPDATE messages SET yesterday = today, today = 0")
         conn.commit()
@@ -594,7 +538,7 @@ async def handle_reset_today(message: types.Message):
         if cache_key in user_cache:
             del user_cache[cache_key]
         
-        await message.reply("✅ Счетчики сообщений на сегодня сброшены.")
+        await message.reply(f"✅ Счетчики сообщений сброшены.\n📊 Сегодня было: {total_today} сообщений от {active_today} пользователей")
         
     except Exception as e:
         logger.error(f"Error in /reset_today: {e}")
@@ -667,55 +611,141 @@ async def count_messages(message: types.Message):
     if cache_key in user_cache:
         del user_cache[cache_key]
 
-# Обработчик всех других сообщений
-@dp.message()
-async def handle_other_messages(message: types.Message):
-    if is_shutting_down:
-        return
-    # Игнорируем все остальные типы сообщений (фото, стикеры и т.д.)
-    pass
-
+# Обновленная функция daily_report
 async def daily_report():
-    """Ежедневный отчет"""
+    """Ежедневный отчет с учетом типов чатов"""
     if is_shutting_down:
         return
         
     try:
-        logger.info("Выполняется ежедневный отчет...")
-        
-        # Сбрасываем счетчики
+        # Получаем список активных чатов из базы данных
         cursor.execute("""
-            UPDATE messages 
-            SET yesterday = today,
-                today = 0,
-                last_updated = CURRENT_TIMESTAMP
+            SELECT chat_id, chat_type FROM chat_settings WHERE is_active = 1
         """)
+        chat_settings = cursor.fetchall()
         
-        conn.commit()
+        # Если нет настроек, используем чаты, где бот активен
+        if not chat_settings:
+            # В этом упрощенном примере отправляем отчет в логи
+            logger.info("Ежедневный отчет: нет настроек чатов")
+            return
         
-        # Очищаем кэш
-        user_cache.clear()
-        
-        logger.info("Ежедневный сброс статистики выполнен.")
-        
+        for chat_id, chat_type_str in chat_settings:
+            try:
+                # Пропускаем каналы и приватные чаты для массовых отчетов
+                if chat_type_str == 'channel':
+                    continue
+                
+                # Получаем отсортированный список участников
+                members_with_stats = await get_sorted_members(chat_id, force_update=True)
+                
+                if not members_with_stats:
+                    continue
+                
+                # Только для групп отправляем отчет
+                if chat_type_str in ['group', 'supergroup']:
+                    text = "📊 <b>Ежедневный отчет</b>\n\n"
+                    text += f"<i>Дата: {datetime.now().strftime('%d.%m.%Y')}</i>\n\n"
+                    
+                    # Формируем отчет по топ-5 участникам
+                    for i, member in enumerate(members_with_stats[:5], 1):
+                        mention = member['mention']
+                        today_count = member['today']
+                        
+                        emoji = "👑" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                        text += f"{emoji} {mention}: {today_count} сообщ.\n"
+                    
+                    # Общая статистика
+                    total_today = sum(member['today'] for member in members_with_stats)
+                    active_today = sum(1 for member in members_with_stats if member['today'] > 0)
+                    
+                    if len(members_with_stats) > 5:
+                        text += f"\n...и еще {len(members_with_stats) - 5} участников\n"
+                    
+                    text += f"\n<b>📈 Итоги дня:</b>\n"
+                    text += f"📨 Сообщений: {total_today}\n"
+                    text += f"👥 Активных: {active_today}\n\n"
+                    text += f"<i>Статистика обнулена до завтра</i>"
+                    
+                    await bot.send_message(chat_id, text)
+                
+                # Сохраняем статистику дня и сбрасываем счетчики
+                today_date = datetime.now().strftime('%Y-%m-%d')
+                total_today = sum(member['today'] for member in members_with_stats)
+                active_today = sum(1 for member in members_with_stats if member['today'] > 0)
+                
+                cursor.execute("""
+                    INSERT OR REPLACE INTO daily_stats 
+                    (date, total_messages, active_users, top_user_id, top_user_count)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    today_date,
+                    total_today,
+                    active_today,
+                    members_with_stats[0]['user_id'] if members_with_stats else None,
+                    members_with_stats[0]['today'] if members_with_stats else 0
+                ))
+                
+                # Сбрасываем счетчики
+                cursor.execute("""
+                    UPDATE messages 
+                    SET yesterday = today,
+                        today = 0,
+                        last_updated = CURRENT_TIMESTAMP
+                """)
+                
+                conn.commit()
+                
+                # Инвалидируем кэш
+                cache_key = f"sorted_members_{chat_id}"
+                if cache_key in user_cache:
+                    del user_cache[cache_key]
+                    
+            except Exception as e:
+                logger.error(f"Error sending daily report to chat {chat_id}: {e}")
+                continue
+                
     except Exception as e:
         logger.error(f"Error in daily_report: {e}")
 
+async def auto_save_daily_stats():
+    """Автосохранение ежедневной статистики"""
+    if is_shutting_down:
+        return
+        
+    try:
+        cursor.execute("SELECT SUM(today) FROM messages")
+        total_today = cursor.fetchone()[0] or 0
+        
+        if total_today > 0:
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE today > 0")
+            active_today = cursor.fetchone()[0] or 0
+            
+            cursor.execute("SELECT user_id, today FROM messages WHERE today > 0 ORDER BY today DESC LIMIT 1")
+            top_user = cursor.fetchone()
+            
+            today_date = datetime.now().strftime('%Y-%m-%d')
+            cursor.execute("""
+                INSERT OR REPLACE INTO daily_stats 
+                (date, total_messages, active_users, top_user_id, top_user_count)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                today_date,
+                total_today,
+                active_today,
+                top_user[0] if top_user else None,
+                top_user[1] if top_user else 0
+            ))
+            conn.commit()
+            
+    except Exception as e:
+        logger.error(f"Error in auto_save_daily_stats: {e}")
+
 async def main():
-    global bot_instance, scheduler_instance, http_server
+    global bot_instance, scheduler_instance
     
     # Сохраняем глобальные ссылки
     bot_instance = bot
-    
-    logger.info("Запуск бота статистики сообщений...")
-    
-    # Запускаем HTTP сервер для health checks
-    try:
-        http_server = await start_http_server()
-        logger.info(f"HTTP сервер запущен на порту {PORT}")
-    except Exception as e:
-        logger.error(f"Ошибка запуска HTTP сервера: {e}")
-        # Продолжаем работу даже если HTTP сервер не запустился
     
     # Регистрируем команды для бота
     try:
@@ -723,8 +753,10 @@ async def main():
             types.BotCommand(command="status", description="📊 Статистика чата"),
             types.BotCommand(command="top", description="🏆 Топ-10 участников"),
             types.BotCommand(command="mystats", description="📈 Ваша статистика"),
-            types.BotCommand(command="help", description="❓ Помощь по командам"),
-            types.BotCommand(command="reset_today", description="🔄 Сбросить счетчики (админы)")
+            types.BotCommand(command="yesterday", description="🗓️ Топ за вчера"),
+            types.BotCommand(command="weekly", description="📅 Статистика за неделю"),
+            types.BotCommand(command="reset_today", description="🔄 Сбросить счетчики"),
+            types.BotCommand(command="help", description="❓ Помощь по командам")
         ])
     except Exception as e:
         logger.error(f"Error setting bot commands: {e}")
@@ -733,17 +765,24 @@ async def main():
     try:
         me = await bot.get_me()
         logger.info(f"Бот успешно авторизован: @{me.username} (ID: {me.id})")
+        logger.info(f"Типы чатов, которые поддерживает бот: приватные, группы, супергруппы")
     except Exception as e:
         logger.error(f"Ошибка авторизации: {e}")
-        logger.error("Проверьте правильность токена API_TOKEN")
+        logger.error("Проверьте правильность токена API_TOKEN или переменной окружения BOT_TOKEN")
         return
     
     # Настройка планировщика
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler_instance = scheduler
     
-    # Ежедневный сброс в полночь
-    scheduler.add_job(daily_report, "cron", hour=0, minute=0, misfire_grace_time=60)
+    # Ежедневный отчет в 23:59
+    scheduler.add_job(daily_report, "cron", hour=23, minute=59, misfire_grace_time=60)
+    
+    # Автосохранение статистики каждый час
+    scheduler.add_job(auto_save_daily_stats, "cron", hour="*", misfire_grace_time=60)
+    
+    # Автоматический сброс счетчиков в полночь
+    scheduler.add_job(daily_report, "cron", hour=0, minute=1, misfire_grace_time=60)
     
     try:
         scheduler.start()
@@ -770,6 +809,16 @@ async def main():
     finally:
         logger.info("Запускаем процедуру завершения...")
         await shutdown()
+        
+        # Дополнительная задержка для завершения всех операций
+        await asyncio.sleep(2)
+        
+        # Явно закрываем event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.stop()
+        
+        logger.info("Бот завершил работу")
 
 if __name__ == "__main__":
     # Устанавливаем обработчик исключений
@@ -788,7 +837,15 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
     finally:
-        # Закрываем event loop
+        # Закрываем все асинхронные задачи
+        tasks = asyncio.all_tasks(loop)
+        for task in tasks:
+            task.cancel()
+        
+        # Ждем завершения задач
+        if tasks:
+            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        
         loop.close()
-        logger.info("Бот завершил работу")
+        logger.info("Event loop закрыт")
         sys.exit(0)
