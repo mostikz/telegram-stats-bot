@@ -776,7 +776,7 @@ async def main():
     scheduler_instance = scheduler
     
     # Ежедневный отчет в 23:59
-    scheduler.add_job(daily_report, "cron", hour=23, minute=59, misfire_grace_time=60)
+    scheduler.add_job(daily_report, "cron", hour=17, minute=00, misfire_grace_time=60)
     
     # Автосохранение статистики каждый час
     scheduler.add_job(auto_save_daily_stats, "cron", hour="*", misfire_grace_time=60)
