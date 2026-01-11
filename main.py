@@ -1,5 +1,3 @@
-Вот исходный код , от него будем плясать. Пока просто запомни его :
-
 import logging
 import sqlite3
 import asyncio
