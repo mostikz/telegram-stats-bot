@@ -1,3 +1,26 @@
+import asyncio
+from aiohttp import web
+import threading
+
+async def health_check(request):
+    return web.Response(text="Bot is running")
+
+def run_http_server():
+    """Запуск HTTP-сервера"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    # Запускаем сервер
+    web.run_app(app, host='0.0.0.0', port=10000)
+
+# В начале main() запустите в отдельном потоке:
+def main():
+    # Запуск HTTP-сервера в отдельном потоке
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
+    
+    # Далее ваш код бота...
 import logging
 import sqlite3
 import asyncio
