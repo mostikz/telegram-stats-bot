@@ -1,31 +1,29 @@
-import asyncio
 import logging
-import os
 import sqlite3
+import asyncio
+import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command
+from aiogram.enums import ParseMode, ChatType
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ================== НАСТРОЙКИ ==================
+# ================== CONFIG ==================
 
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не задан в переменных окружения")
+    raise RuntimeError("BOT_TOKEN not set")
 
-DB_PATH = "/var/data/stats.db"  # Persistent Disk Render
+DB_PATH = "/var/data/stats.db"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ================== BOT ==================
 
 bot = Bot(
     token=API_TOKEN,
@@ -33,7 +31,9 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================== DB ==================
+scheduler: AsyncIOScheduler | None = None
+
+# ================== DATABASE ==================
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
 cursor = conn.cursor()
@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS messages (
     today INTEGER DEFAULT 0,
     yesterday INTEGER DEFAULT 0,
     total INTEGER DEFAULT 0,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
 
@@ -106,33 +107,36 @@ async def status(message: types.Message):
     if message.chat.type == ChatType.CHANNEL:
         return
 
-    data = await get_sorted_members(message.chat.id)
+    members = await get_sorted_members(message.chat.id)
 
-    if not data:
-        await message.answer("📊 Пока нет статистики.")
+    if not members:
+        await message.reply("📊 Пока нет статистики.")
         return
 
     text = "<b>📊 Статистика сообщений</b>\n\n"
-    for i, m in enumerate(data[:10], 1):
+    for i, m in enumerate(members[:10], 1):
         text += (
             f"<b>{i}. {m['username']}</b>\n"
             f"Сегодня: {m['today']} | Вчера: {m['yesterday']} | Всего: {m['total']}\n\n"
         )
 
-    await message.answer(text)
+    await message.reply(text)
 
 # ================== MESSAGE COUNTER ==================
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def count(message: types.Message):
-    if message.from_user.is_bot:
+    if message.from_user.is_bot or message.chat.type == ChatType.CHANNEL:
         return
 
     uid = message.from_user.id
     name = message.from_user.full_name
     now = datetime.utcnow()
 
-    cursor.execute("SELECT today, total, last_updated FROM messages WHERE user_id=?", (uid,))
+    cursor.execute(
+        "SELECT today, total, last_updated FROM messages WHERE user_id=?",
+        (uid,)
+    )
     row = cursor.fetchone()
 
     if row:
@@ -140,20 +144,20 @@ async def count(message: types.Message):
         if last.date() < now.date():
             cursor.execute("""
                 UPDATE messages
-                SET yesterday = today,
-                    today = 1,
-                    total = total + 1,
-                    username = ?,
-                    last_updated = CURRENT_TIMESTAMP
+                SET yesterday=today,
+                    today=1,
+                    total=total+1,
+                    username=?,
+                    last_updated=CURRENT_TIMESTAMP
                 WHERE user_id=?
             """, (name, uid))
         else:
             cursor.execute("""
                 UPDATE messages
-                SET today = today + 1,
-                    total = total + 1,
-                    username = ?,
-                    last_updated = CURRENT_TIMESTAMP
+                SET today=today+1,
+                    total=total+1,
+                    username=?,
+                    last_updated=CURRENT_TIMESTAMP
                 WHERE user_id=?
             """, (name, uid))
     else:
@@ -168,30 +172,34 @@ async def count(message: types.Message):
 # ================== SCHEDULER ==================
 
 async def daily_reset():
-    cursor.execute("SELECT SUM(today) FROM messages")
-    total = cursor.fetchone()[0] or 0
-
     cursor.execute("""
         UPDATE messages
-        SET yesterday = today,
-            today = 0,
-            last_updated = CURRENT_TIMESTAMP
+        SET yesterday=today,
+            today=0,
+            last_updated=CURRENT_TIMESTAMP
     """)
     conn.commit()
-
-    logger.info(f"📅 День закрыт. Сообщений: {total}")
+    logger.info("📅 Daily reset complete")
 
 # ================== MAIN ==================
 
 async def main():
+    global scheduler
+
     me = await bot.get_me()
-    logger.info(f"🤖 Бот запущен: @{me.username}")
+    logger.info(f"🤖 Bot started: @{me.username}")
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(daily_reset, "cron", hour=0, minute=0)
     scheduler.start()
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        logger.info("Shutting down...")
+        scheduler.shutdown(wait=False)
+        await bot.session.close()
+        conn.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
