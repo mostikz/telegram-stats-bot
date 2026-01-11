@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        value: "8280794130:AAE7VgMxB0mGR2adpu8FR3SBUS-YjKUydjI"
+      - key: PORT
+        value: 8080
