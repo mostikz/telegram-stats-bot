@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 bot_instance = None
 scheduler_instance = None
 is_shutting_down = False
+polling_task = None
 
 async def shutdown():
     """Корректное завершение работы бота"""
@@ -35,6 +36,23 @@ async def shutdown():
         
     is_shutting_down = True
     logger.info("Начинаем корректное завершение работы...")
+    
+    try:
+        # Останавливаем polling
+        if dp and hasattr(dp, '_stopped') and not dp._stopped:
+            await dp.stop_polling()
+            logger.info("Polling остановлен")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке polling: {e}")
+    
+    try:
+        # Отменяем задачу polling
+        global polling_task
+        if polling_task and not polling_task.done():
+            polling_task.cancel()
+            logger.info("Задача polling отменена")
+    except Exception as e:
+        logger.error(f"Ошибка при отмене задачи polling: {e}")
     
     try:
         # Останавливаем планировщик
@@ -325,9 +343,79 @@ async def get_sorted_members(chat_id, force_update=False):
         
         return members_with_stats
 
+# Обработчик команды /start
+@dp.message(Command("start"))
+async def handle_start(message: types.Message):
+    """Обработчик команды /start"""
+    if is_shutting_down:
+        return
+        
+    logger.info(f"Command /start received from {message.from_user.id} in chat {message.chat.id}")
+    
+    welcome_text = """
+👋 Привет! Я бот для подсчета статистики сообщений в чате.
+
+📊 Я буду считать:
+• Сообщения за сегодня
+• Сообщения за вчера
+• Общее количество сообщений
+
+📋 <b>Доступные команды:</b>
+
+📊 <b>Общие команды:</b>
+/status - Статистика чата
+/top - Топ-10 участников сегодня
+/mystats - Ваша личная статистика
+/yesterday - Топ за вчера
+/weekly - Статистика за неделю
+/help - Помощь по командам
+
+⚙️ <b>Для администраторов:</b>
+/reset_today - Сбросить счетчики на сегодня
+
+📅 <b>Автоматически:</b>
+• Ежедневный отчет в 23:59
+• Автосброс в полночь
+
+<i>Бот подсчитывает все текстовые сообщения в чате</i>
+Добавьте меня в группу и дайте права администратора для лучшей работы!
+"""
+    await message.reply(welcome_text)
+
+# Обработчик команды /help
+@dp.message(Command("help"))
+async def handle_help(message: types.Message):
+    """Обработчик команды /help"""
+    if is_shutting_down:
+        return
+        
+    help_text = """
+<b>📚 Доступные команды:</b>
+
+📊 <b>Общие команды:</b>
+/status - Статистика чата
+/top - Топ-10 участников сегодня
+/mystats - Ваша личная статистика
+/yesterday - Топ за вчера
+/weekly - Статистика за неделю
+
+⚙️ <b>Для администраторов:</b>
+/reset_today - Сбросить счетчики на сегодня
+
+📅 <b>Автоматически:</b>
+• Ежедневный отчет в 23:59
+• Автосброс в полночь
+
+<i>Бот подсчитывает все текстовые сообщения в чате</i>
+
+💡 <b>Совет:</b> Добавьте бота в группу и дайте права администратора для лучшей работы!
+"""
+    await message.reply(help_text)
+
 # Обработчик команды /status с проверкой типа чата
 @dp.message(Command("status"))
 async def handle_status(message: types.Message):
+    """Обработчик команды /status"""
     if is_shutting_down:
         return
         
@@ -398,12 +486,62 @@ async def handle_status(message: types.Message):
         except:
             pass
 
+# Обработчик команды /mystats
+@dp.message(Command("mystats"))
+async def handle_mystats(message: types.Message):
+    """Обработчик команды /mystats"""
+    if is_shutting_down:
+        return
+        
+    logger.info(f"Command /mystats received from {message.from_user.id}")
+    
+    try:
+        user_id = message.from_user.id
+        
+        # Получаем статистику пользователя
+        cursor.execute("""
+            SELECT username, today, yesterday, total, first_seen 
+            FROM messages WHERE user_id=?
+        """, (user_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            username, today, yesterday, total, first_seen = row
+            
+            # Форматируем дату первого сообщения
+            try:
+                if isinstance(first_seen, str):
+                    first_seen_date = datetime.fromisoformat(first_seen.split('.')[0])
+                else:
+                    first_seen_date = first_seen
+                first_seen_str = first_seen_date.strftime('%d.%m.%Y')
+            except:
+                first_seen_str = "неизвестно"
+                
+            text = f"<b>📊 Ваша статистика</b>\n\n"
+            text += f"👤 <b>{username}</b>\n"
+            text += f"📅 <b>Сегодня:</b> {today} сообщений\n"
+            text += f"🗓️ <b>Вчера:</b> {yesterday} сообщений\n"
+            text += f"📊 <b>Всего:</b> {total} сообщений\n"
+            text += f"📅 <b>С нами с:</b> {first_seen_str}\n\n"
+            text += f"<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+            
+            await message.reply(text)
+        else:
+            await message.reply("📊 У вас еще нет статистики. Напишите что-нибудь в чате!")
+            
+    except Exception as e:
+        logger.error(f"Error in /mystats: {e}")
+        await message.reply("⚠️ Произошла ошибка при получении статистики.")
+
 # Обработчик команды /top с проверкой типа чата
 @dp.message(Command("top"))
 async def handle_top(message: types.Message):
     """Показать топ участников по сообщениям"""
     if is_shutting_down:
         return
+        
+    logger.info(f"Command /top received from {message.from_user.id} in chat {message.chat.id}")
         
     try:
         chat_id = message.chat.id
@@ -468,12 +606,128 @@ async def handle_top(message: types.Message):
         except:
             pass
 
+# Обработчик команды /yesterday
+@dp.message(Command("yesterday"))
+async def handle_yesterday(message: types.Message):
+    """Обработчик команды /yesterday"""
+    if is_shutting_down:
+        return
+        
+    logger.info(f"Command /yesterday received from {message.from_user.id}")
+    
+    try:
+        chat_id = message.chat.id
+        chat_type = message.chat.type
+        
+        if chat_type == ChatType.CHANNEL:
+            await message.reply("⚠️ В каналах статистика не собирается.")
+            return
+        
+        # Получаем статистику за вчера
+        cursor.execute("""
+            SELECT user_id, username, yesterday as count 
+            FROM messages 
+            WHERE yesterday > 0 
+            ORDER BY yesterday DESC 
+            LIMIT 10
+        """)
+        rows = cursor.fetchall()
+        
+        if not rows:
+            await message.reply("📊 Вчера не было сообщений или статистика не собрана.")
+            return
+            
+        text = "<b>📊 Топ за вчера</b>\n\n"
+        
+        for i, (user_id, username, count) in enumerate(rows, 1):
+            emoji = "👑" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            
+            # Формируем упоминание
+            mention = username
+            if chat_type not in [ChatType.PRIVATE, ChatType.CHANNEL]:
+                mention = f"<a href='tg://user?id={user_id}'>{username}</a>"
+                
+            text += f"{emoji} <b>{mention}:</b> {count} сообщ.\n"
+        
+        # Добавляем общую статистику за вчера
+        cursor.execute("SELECT SUM(yesterday) FROM messages")
+        total_yesterday = cursor.fetchone()[0] or 0
+        
+        text += f"\n<b>📈 Итого за вчера:</b> {total_yesterday} сообщений\n"
+        text += f"<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+        
+        await message.reply(text)
+        
+    except Exception as e:
+        logger.error(f"Error in /yesterday: {e}")
+        await message.reply("⚠️ Произошла ошибка при получении статистики.")
+
+# Обработчик команды /weekly
+@dp.message(Command("weekly"))
+async def handle_weekly(message: types.Message):
+    """Обработчик команды /weekly"""
+    if is_shutting_down:
+        return
+        
+    logger.info(f"Command /weekly received from {message.from_user.id}")
+    
+    try:
+        # Получаем статистику за последние 7 дней
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=7)
+        
+        cursor.execute("""
+            SELECT date, total_messages, active_users 
+            FROM daily_stats 
+            WHERE date BETWEEN ? AND ?
+            ORDER BY date DESC
+        """, (start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')))
+        
+        rows = cursor.fetchall()
+        
+        if not rows:
+            await message.reply("📊 Недостаточно данных для недельного отчета.")
+            return
+            
+        text = "<b>📅 Статистика за неделю</b>\n\n"
+        
+        total_messages_week = 0
+        total_active_week = 0
+        
+        for date_str, total_messages, active_users in rows:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            text += f"<b>{date_obj.strftime('%d.%m')}:</b> {total_messages} сообщ. от {active_users} чел.\n"
+            total_messages_week += total_messages
+            total_active_week += active_users
+        
+        # Если есть дни без данных, добавляем информацию
+        days_with_data = len(rows)
+        if days_with_data < 7:
+            text += f"\n<i>Данных за {7 - days_with_data} дней нет</i>\n"
+        
+        text += f"\n<b>📈 Итоги недели:</b>\n"
+        text += f"📨 Сообщений: {total_messages_week}\n"
+        text += f"👥 Активных пользователей: {total_active_week}\n"
+        
+        if days_with_data > 0:
+            text += f"📊 В среднем в день: {total_messages_week // days_with_data} сообщ."
+        
+        text += f"\n\n<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+        
+        await message.reply(text)
+        
+    except Exception as e:
+        logger.error(f"Error in /weekly: {e}")
+        await message.reply("⚠️ Произошла ошибка при получении недельной статистики.")
+
 # Обработчик команды /reset_today с проверкой типа чата
 @dp.message(Command("reset_today"))
 async def handle_reset_today(message: types.Message):
     """Сбросить счетчики на сегодня (только для администраторов)"""
     if is_shutting_down:
         return
+        
+    logger.info(f"Command /reset_today received from {message.from_user.id} in chat {message.chat.id}")
         
     try:
         chat_type = message.chat.type
@@ -550,6 +804,7 @@ async def handle_reset_today(message: types.Message):
 # Обновленный обработчик всех сообщений
 @dp.message(F.text & ~F.text.startswith('/'))
 async def count_messages(message: types.Message):
+    """Обработчик всех текстовых сообщений"""
     if is_shutting_down:
         return
         
@@ -741,8 +996,31 @@ async def auto_save_daily_stats():
     except Exception as e:
         logger.error(f"Error in auto_save_daily_stats: {e}")
 
+async def auto_reset_counters():
+    """Автоматический сброс счетчиков"""
+    if is_shutting_down:
+        return
+        
+    try:
+        logger.info("Автоматический сброс счетчиков")
+        
+        # Сохраняем текущую статистику
+        await auto_save_daily_stats()
+        
+        # Сбрасываем счетчики
+        cursor.execute("UPDATE messages SET yesterday = today, today = 0")
+        conn.commit()
+        
+        # Очищаем кэш
+        user_cache.clear()
+        
+        logger.info("Счетчики успешно сброшены")
+        
+    except Exception as e:
+        logger.error(f"Error in auto_reset_counters: {e}")
+
 async def main():
-    global bot_instance, scheduler_instance
+    global bot_instance, scheduler_instance, polling_task
     
     # Сохраняем глобальные ссылки
     bot_instance = bot
@@ -750,6 +1028,7 @@ async def main():
     # Регистрируем команды для бота
     try:
         await bot.set_my_commands([
+            types.BotCommand(command="start", description="🚀 Запустить бота"),
             types.BotCommand(command="status", description="📊 Статистика чата"),
             types.BotCommand(command="top", description="🏆 Топ-10 участников"),
             types.BotCommand(command="mystats", description="📈 Ваша статистика"),
@@ -758,6 +1037,7 @@ async def main():
             types.BotCommand(command="reset_today", description="🔄 Сбросить счетчики"),
             types.BotCommand(command="help", description="❓ Помощь по командам")
         ])
+        logger.info("Команды бота зарегистрированы")
     except Exception as e:
         logger.error(f"Error setting bot commands: {e}")
     
@@ -776,13 +1056,13 @@ async def main():
     scheduler_instance = scheduler
     
     # Ежедневный отчет в 23:59
-    scheduler.add_job(daily_report, "cron", hour=17, minute=00, misfire_grace_time=60)
+    scheduler.add_job(daily_report, "cron", hour=23, minute=59, misfire_grace_time=60)
     
     # Автосохранение статистики каждый час
     scheduler.add_job(auto_save_daily_stats, "cron", hour="*", misfire_grace_time=60)
     
     # Автоматический сброс счетчиков в полночь
-    scheduler.add_job(daily_report, "cron", hour=0, minute=1, misfire_grace_time=60)
+    scheduler.add_job(auto_reset_counters, "cron", hour=0, minute=0, misfire_grace_time=60)
     
     try:
         scheduler.start()
@@ -799,7 +1079,8 @@ async def main():
     
     try:
         logger.info("Бот запущен и готов к работе...")
-        await dp.start_polling(bot, skip_updates=True, handle_signals=False)
+        polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True, handle_signals=False))
+        await polling_task
     except asyncio.CancelledError:
         logger.info("Получен сигнал отмены")
     except KeyboardInterrupt:
@@ -809,16 +1090,6 @@ async def main():
     finally:
         logger.info("Запускаем процедуру завершения...")
         await shutdown()
-        
-        # Дополнительная задержка для завершения всех операций
-        await asyncio.sleep(2)
-        
-        # Явно закрываем event loop
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.stop()
-        
-        logger.info("Бот завершил работу")
 
 if __name__ == "__main__":
     # Устанавливаем обработчик исключений
