@@ -470,7 +470,7 @@ async def handle_status(message: types.Message):
                 text += f"📅 <b>Сегодня:</b> {user_stats['today']} сообщений\n"
                 text += f"🗓️ <b>Вчера:</b> {user_stats['yesterday']} сообщений\n"
                 text += f"📊 <b>Всего:</b> {user_stats['total']} сообщений\n\n"
-                text += f"<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+                text += f"<i>🕐 Обновлено: {format_moscow_time()} (MSK)</i>"
             else:
                 text = "📊 Пока нет статистики сообщений."
         else:
@@ -547,7 +547,7 @@ async def handle_mystats(message: types.Message):
             text += f"🗓️ <b>Вчера:</b> {yesterday} сообщений\n"
             text += f"📊 <b>Всего:</b> {total} сообщений\n"
             text += f"📅 <b>С нами с:</b> {first_seen_str}\n\n"
-            text += f"<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+            text += f"<i>🕐 Обновлено: {datetime.now(MSK).strftime('%H:%M:%S')}</i>"
             
             await message.reply(text)
         else:
@@ -618,7 +618,7 @@ async def handle_top(message: types.Message):
         text += f"<b>📈 Итого по чату:</b>\n"
         text += f"   📅 Сегодня: {total_today} сообщ.\n"
         text += f"   📊 Всего: {total_all} сообщ.\n\n"
-        text += f"<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+        text += f"<i>🕐 Обновлено: {datetime.now(MSK).strftime('%H:%M:%S')}</i>"
         
         await message.reply(text)
         
@@ -677,7 +677,7 @@ async def handle_yesterday(message: types.Message):
         total_yesterday = cursor.fetchone()[0] or 0
         
         text += f"\n<b>📈 Итого за вчера:</b> {total_yesterday} сообщений\n"
-        text += f"<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+        text += f"<i>🕐 Обновлено: {datetime.now(MSK).strftime('%H:%M:%S')}</i>"
         
         await message.reply(text)
         
@@ -735,7 +735,7 @@ async def handle_weekly(message: types.Message):
         if days_with_data > 0:
             text += f"📊 В среднем в день: {total_messages_week // days_with_data} сообщ."
         
-        text += f"\n\n<i>🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}</i>"
+        text += f"\n\n<i>🕐 Обновлено: {datetime.now(MSK).strftime('%H:%M:%S')}</i>"
         
         await message.reply(text)
         
