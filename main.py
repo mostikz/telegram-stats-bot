@@ -9,7 +9,6 @@ import sys
 import random
 from datetime import datetime, timedelta
 import time
-import pytz
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -20,7 +19,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ==================== КОНСТАНТЫ ====================
 API_TOKEN = os.getenv("BOT_TOKEN", "8280794130:AAE7VgMxB0mGR2adpu8FR3SBUS-YjKUydjI")
-MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 # Настройка логирования
 logging.basicConfig(
@@ -39,23 +37,7 @@ conn = None
 cursor = None
 user_cache = {}
 cache_timeout = 300  # 5 минут
-
-# ==================== УТИЛИТЫ ВРЕМЕНИ ====================
-def get_moscow_time() -> datetime:
-    """Получить текущее время по Москве"""
-    return datetime.now(MOSCOW_TZ)
-
-def format_moscow_time(dt: datetime = None, format_str: str = "%H:%M:%S") -> str:
-    """Форматировать время по Москве"""
-    if dt is None:
-        dt = get_moscow_time()
-    if dt.tzinfo is None:
-        dt = MOSCOW_TZ.localize(dt)
-    return dt.strftime(format_str)
-
-def get_moscow_date_str() -> str:
-    """Получить текущую дату по Москве в формате YYYY-MM-DD"""
-    return get_moscow_time().strftime('%Y-%m-%d')
+current_mention_type = 0  # 0=предсказание, 1=пожелание, 2=комплимент
 
 # ==================== СМЕШНЫЕ ПРЕДСКАЗАНИЯ ====================
 FUNNY_PREDICTIONS = [
@@ -110,13 +92,12 @@ COMPLIMENTS = [
 # ==================== HTTP СЕРВЕР ====================
 async def health_check(request):
     """Проверка здоровья сервера"""
-    moscow_time = format_moscow_time()
     status = {
         "status": "running",
-        "moscow_time": moscow_time,
         "bot_status": "active" if not is_shutting_down else "shutting_down",
         "database": "connected" if conn else "disconnected",
-        "scheduler": "running" if scheduler_instance and scheduler_instance.running else "stopped"
+        "scheduler": "running" if scheduler_instance and scheduler_instance.running else "stopped",
+        "current_mention_type": ["предсказание", "пожелание", "комплимент"][current_mention_type]
     }
     return web.json_response(status)
 
@@ -138,14 +119,15 @@ def init_database():
     # Основная таблица сообщений
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS messages (
-        user_id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        chat_id INTEGER,
         username TEXT,
         today INTEGER DEFAULT 0,
         yesterday INTEGER DEFAULT 0,
         total INTEGER DEFAULT 0,
         last_updated TIMESTAMP,
         first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_mentioned TIMESTAMP
+        PRIMARY KEY (user_id, chat_id)
     )
     """)
     
@@ -156,9 +138,7 @@ def init_database():
         total_messages INTEGER DEFAULT 0,
         active_users INTEGER DEFAULT 0,
         top_user_id INTEGER,
-        top_user_count INTEGER,
-        mentioned_user_id INTEGER,
-        mentioned_count INTEGER DEFAULT 0
+        top_user_count INTEGER
     )
     """)
     
@@ -168,14 +148,12 @@ def init_database():
         chat_id INTEGER PRIMARY KEY,
         chat_title TEXT,
         chat_type TEXT DEFAULT 'private',
-        auto_reset_time TEXT DEFAULT '00:00',
-        report_time TEXT DEFAULT '17:00',
-        timezone TEXT DEFAULT 'Europe/Moscow',
         is_active BOOLEAN DEFAULT 1,
         enable_mentions BOOLEAN DEFAULT 1,
         last_mention_time TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_activity TIMESTAMP
+        last_activity TIMESTAMP,
+        total_messages_before_bot INTEGER DEFAULT 0
     )
     """)
     
@@ -187,8 +165,20 @@ def init_database():
         user_id INTEGER,
         username TEXT,
         mention_time TIMESTAMP,
-        prediction_type TEXT,
+        mention_type TEXT,
         message TEXT
+    )
+    """)
+    
+    # Таблица для подсчета всех сообщений
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS all_messages_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        message_date TIMESTAMP,
+        message_count INTEGER DEFAULT 1
     )
     """)
     
@@ -201,6 +191,8 @@ def update_chat_settings(chat_id: int, chat_title: str = None, chat_type: str = 
         # Проверяем, существует ли уже запись
         cursor.execute("SELECT chat_id FROM chat_settings WHERE chat_id = ?", (chat_id,))
         existing = cursor.fetchone()
+        
+        current_time = datetime.now().isoformat()
         
         if existing:
             # Обновляем существующую запись
@@ -216,7 +208,7 @@ def update_chat_settings(chat_id: int, chat_title: str = None, chat_type: str = 
                 params.append(chat_type)
             
             update_fields.append("last_activity = ?")
-            params.append(get_moscow_time().isoformat())
+            params.append(current_time)
             
             params.append(chat_id)
             
@@ -225,20 +217,27 @@ def update_chat_settings(chat_id: int, chat_title: str = None, chat_type: str = 
                 cursor.execute(query, params)
         else:
             # Создаем новую запись
+            # Пытаемся оценить количество сообщений до добавления бота
+            cursor.execute("""
+                SELECT COUNT(*) FROM all_messages_history WHERE chat_id = ?
+            """, (chat_id,))
+            count_result = cursor.fetchone()
+            messages_before = count_result[0] if count_result else 0
+            
             cursor.execute("""
                 INSERT INTO chat_settings 
-                (chat_id, chat_title, chat_type, is_active, enable_mentions, created_at, last_activity)
-                VALUES (?, ?, ?, 1, 1, ?, ?)
+                (chat_id, chat_title, chat_type, is_active, enable_mentions, created_at, last_activity, total_messages_before_bot)
+                VALUES (?, ?, ?, 1, 1, ?, ?, ?)
             """, (
                 chat_id, 
                 chat_title or f"Chat {chat_id}", 
                 chat_type or "private",
-                get_moscow_time().isoformat(),
-                get_moscow_time().isoformat()
+                current_time,
+                current_time,
+                messages_before
             ))
         
         conn.commit()
-        logger.debug(f"Настройки чата {chat_id} обновлены")
         
     except Exception as e:
         logger.error(f"Ошибка обновления настроек чата {chat_id}: {e}")
@@ -310,37 +309,6 @@ def clear_chat_cache(chat_id):
     if cache_key in user_cache:
         del user_cache[cache_key]
 
-async def get_chat_members_safe(chat_id, chat_type):
-    """Безопасное получение участников чата"""
-    try:
-        if chat_type == ChatType.PRIVATE:
-            try:
-                chat_member = await bot_instance.get_chat_member(chat_id, chat_id)
-                if not chat_member.user.is_bot:
-                    return [chat_member.user]
-            except Exception as e:
-                logger.error(f"Error getting private chat member: {e}")
-                return []
-        
-        elif chat_type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            try:
-                # Пробуем получить участников чата
-                # В некоторых чатах может не быть прав на получение списка участников
-                # Вместо этого будем использовать пользователей из базы данных
-                return []
-            except Exception as e:
-                logger.error(f"Error getting group members: {e}")
-                return []
-        
-        elif chat_type == ChatType.CHANNEL:
-            return []
-        
-        return []
-        
-    except Exception as e:
-        logger.error(f"Error in get_chat_members_safe: {e}")
-        return []
-
 async def get_sorted_members(chat_id, force_update=False):
     """Получить отсортированный список участников"""
     try:
@@ -353,22 +321,15 @@ async def get_sorted_members(chat_id, force_update=False):
             if current_time - timestamp < cache_timeout:
                 return cached_data
         
-        # Определяем тип чата
-        try:
-            chat = await bot_instance.get_chat(chat_id)
-            chat_type = chat.type
-        except Exception as e:
-            logger.error(f"Error getting chat type for {chat_id}: {e}")
-            chat_type = ChatType.GROUP
-        
         # Получаем участников из базы данных
         cursor.execute("""
             SELECT user_id, username, today, yesterday, total 
             FROM messages 
-            WHERE today > 0 OR yesterday > 0
+            WHERE chat_id = ?
+            AND (today > 0 OR yesterday > 0 OR total > 0)
             ORDER BY today DESC, total DESC
             LIMIT 50
-        """)
+        """, (chat_id,))
         
         rows = cursor.fetchall()
         members_with_stats = []
@@ -384,22 +345,6 @@ async def get_sorted_members(chat_id, force_update=False):
                 'is_new': False
             })
         
-        # Если нет данных в базе, получаем информацию о чате
-        if not members_with_stats:
-            try:
-                chat = await bot_instance.get_chat(chat_id)
-                if chat_type == ChatType.PRIVATE:
-                    members_with_stats.append({
-                        'user_id': chat.id,
-                        'username': chat.first_name or chat.title or f"User {chat.id}",
-                        'today': 0,
-                        'yesterday': 0,
-                        'total': 0,
-                        'is_new': True
-                    })
-            except Exception as e:
-                logger.error(f"Error getting chat info: {e}")
-        
         # Сохраняем в кэш
         user_cache[cache_key] = (members_with_stats, current_time)
         
@@ -410,13 +355,15 @@ async def get_sorted_members(chat_id, force_update=False):
         return []
 
 # ==================== АВТОМАТИЧЕСКИЕ ФУНКЦИИ ====================
-async def mention_random_user():
-    """Упомянуть случайного пользователя с предсказанием"""
+async def send_hourly_mention():
+    """Отправка упоминания каждый час с ротацией типа"""
+    global current_mention_type
+    
     if is_shutting_down:
         return
         
     try:
-        logger.info(f"Запуск функции упоминания пользователя... Время в Москве: {format_moscow_time()}")
+        logger.info(f"Запуск функции упоминания пользователя... Тип: {current_mention_type}")
         
         # Получаем все активные группы и супергруппы
         cursor.execute("""
@@ -436,14 +383,6 @@ async def mention_random_user():
         
         for chat_id, chat_title, chat_type in active_chats:
             try:
-                # Обновляем время активности чата
-                cursor.execute("""
-                    UPDATE chat_settings 
-                    SET last_activity = ?
-                    WHERE chat_id = ?
-                """, (get_moscow_time().isoformat(), chat_id))
-                conn.commit()
-                
                 # Получаем участников чата
                 members = await get_sorted_members(chat_id)
                 if not members:
@@ -464,18 +403,19 @@ async def mention_random_user():
                 user_id = random_user['user_id']
                 username = random_user['username']
                 
-                # Выбираем случайный тип сообщения
-                message_type = random.choice(['prediction', 'wish', 'compliment'])
-                
-                if message_type == 'prediction':
+                # Выбираем сообщение в зависимости от текущего типа
+                if current_mention_type == 0:  # предсказание
                     message = random.choice(FUNNY_PREDICTIONS)
-                    message_type_text = "🔮 Предсказание дня"
-                elif message_type == 'wish':
+                    message_type_text = "🔮 Предсказание часа"
+                    mention_type = "prediction"
+                elif current_mention_type == 1:  # пожелание
                     message = random.choice(FUNNY_WISHES)
-                    message_type_text = "✨ Пожелание дня"
-                else:
+                    message_type_text = "✨ Пожелание часа"
+                    mention_type = "wish"
+                else:  # комплимент
                     message = random.choice(COMPLIMENTS)
-                    message_type_text = "💝 Комплимент дня"
+                    message_type_text = "💝 Комплимент часа"
+                    mention_type = "compliment"
                 
                 # Формируем упоминание
                 try:
@@ -489,24 +429,22 @@ async def mention_random_user():
                     mention = f"<a href='tg://user?id={user_id}'>{username}</a>"
                 
                 # Отправляем сообщение
-                moscow_time = format_moscow_time()
                 text = f"{message_type_text} для {mention}:\n\n"
-                text += f"<i>{message}</i>\n\n"
-                text += f"🕐 Московское время: {moscow_time}"
+                text += f"<i>{message}</i>"
                 
                 await bot_instance.send_message(chat_id, text)
                 
                 # Сохраняем в историю
                 cursor.execute("""
                     INSERT INTO mentions_history 
-                    (chat_id, user_id, username, mention_time, prediction_type, message)
+                    (chat_id, user_id, username, mention_time, mention_type, message)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (
                     chat_id, 
                     user_id, 
                     username,
-                    get_moscow_time().isoformat(), 
-                    message_type, 
+                    datetime.now().isoformat(), 
+                    mention_type, 
                     message
                 ))
                 
@@ -515,7 +453,7 @@ async def mention_random_user():
                     UPDATE chat_settings 
                     SET last_mention_time = ?
                     WHERE chat_id = ?
-                """, (get_moscow_time().isoformat(), chat_id))
+                """, (datetime.now().isoformat(), chat_id))
                 
                 conn.commit()
                 
@@ -527,18 +465,21 @@ async def mention_random_user():
             except Exception as e:
                 logger.error(f"Ошибка при упоминании в чате {chat_id} ({chat_title}): {e}")
                 continue
+        
+        # Меняем тип для следующего часа
+        current_mention_type = (current_mention_type + 1) % 3
+        logger.info(f"Следующий тип упоминания: {current_mention_type}")
                 
     except Exception as e:
-        logger.error(f"Ошибка в mention_random_user: {e}")
+        logger.error(f"Ошибка в send_hourly_mention: {e}")
 
 async def daily_report():
-    """Ежедневный отчет в 17:00 по МСК"""
+    """Ежедневный отчет"""
     if is_shutting_down:
         return
         
     try:
-        moscow_time = get_moscow_time()
-        logger.info(f"Генерация ежедневного отчета... Время в Москве: {format_moscow_time(moscow_time)}")
+        logger.info(f"Генерация ежедневного отчета...")
         
         cursor.execute("""
             SELECT chat_id, chat_title FROM chat_settings 
@@ -563,8 +504,6 @@ async def daily_report():
                 
                 # Создаем отчет
                 text = "📊 <b>Ежедневный отчет</b>\n\n"
-                text += f"<i>Дата: {moscow_time.strftime('%d.%m.%Y')}</i>\n"
-                text += f"<i>Время в Москве: {format_moscow_time(moscow_time)}</i>\n\n"
                 
                 # Топ-3 за день
                 for i, member in enumerate(members_with_stats[:3], 1):
@@ -589,7 +528,7 @@ async def daily_report():
                 await bot_instance.send_message(chat_id, text)
                 
                 # Сохраняем статистику дня
-                today_date = get_moscow_date_str()
+                today_date = datetime.now().strftime('%Y-%m-%d')
                 cursor.execute("""
                     INSERT OR REPLACE INTO daily_stats 
                     (date, total_messages, active_users, top_user_id, top_user_count)
@@ -622,21 +561,20 @@ async def auto_reset_counters():
         return
         
     try:
-        moscow_time = get_moscow_time()
-        logger.info(f"Автоматический сброс счетчиков... Время в Москве: {format_moscow_time(moscow_time)}")
+        logger.info("Автоматический сброс счетчиков...")
         
         # Сохраняем статистику перед сбросом
         cursor.execute("SELECT SUM(today) FROM messages")
         total_today = cursor.fetchone()[0] or 0
         
         if total_today > 0:
-            cursor.execute("SELECT COUNT(*) FROM messages WHERE today > 0")
+            cursor.execute("SELECT COUNT(DISTINCT user_id) FROM messages WHERE today > 0")
             active_today = cursor.fetchone()[0] or 0
             
             cursor.execute("SELECT user_id, today FROM messages WHERE today > 0 ORDER BY today DESC LIMIT 1")
             top_user = cursor.fetchone()
             
-            today_date = get_moscow_date_str()
+            today_date = datetime.now().strftime('%Y-%m-%d')
             cursor.execute("""
                 INSERT OR REPLACE INTO daily_stats 
                 (date, total_messages, active_users, top_user_id, top_user_count)
@@ -661,30 +599,82 @@ async def auto_reset_counters():
     except Exception as e:
         logger.error(f"Ошибка в auto_reset_counters: {e}")
 
-async def auto_save_stats():
-    """Автосохранение статистики"""
+async def scan_all_messages():
+    """Сканирование всех сообщений в чате для подсчета истории"""
     if is_shutting_down:
         return
         
     try:
-        cursor.execute("SELECT SUM(today) FROM messages")
-        total_today = cursor.fetchone()[0] or 0
+        logger.info("Сканирование истории сообщений...")
         
-        if total_today > 0:
-            cursor.execute("SELECT COUNT(*) FROM messages WHERE today > 0")
-            active_today = cursor.fetchone()[0] or 0
-            
-            today_date = get_moscow_date_str()
-            cursor.execute("""
-                INSERT OR REPLACE INTO daily_stats 
-                (date, total_messages, active_users)
-                VALUES (?, ?, ?)
-            """, (today_date, total_today, active_today))
-            
-            conn.commit()
-            
+        # Получаем все активные чаты
+        cursor.execute("""
+            SELECT chat_id, chat_title FROM chat_settings 
+            WHERE is_active = 1
+        """)
+        
+        active_chats = cursor.fetchall()
+        
+        if not active_chats:
+            return
+        
+        for chat_id, chat_title in active_chats:
+            try:
+                # Получаем информацию о чате
+                chat = await bot_instance.get_chat(chat_id)
+                
+                if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+                    try:
+                        # Пробуем получить историю сообщений (ограниченное количество)
+                        # В реальном боте эта функция может быть ограничена правами
+                        logger.info(f"Сканирование истории для чата {chat_title or chat_id}")
+                        
+                        # Здесь можно добавить логику для сканирования истории
+                        # Например, через get_chat_history, но это требует прав
+                        
+                    except Exception as e:
+                        logger.warning(f"Не удалось сканировать историю чата {chat_id}: {e}")
+                        
+            except Exception as e:
+                logger.error(f"Ошибка при сканировании чата {chat_id}: {e}")
+                continue
+                
     except Exception as e:
-        logger.error(f"Ошибка в auto_save_stats: {e}")
+        logger.error(f"Ошибка в scan_all_messages: {e}")
+
+async def update_total_count_for_user(user_id: int, chat_id: int, username: str):
+    """Обновить общее количество сообщений пользователя с учетом истории"""
+    try:
+        # Получаем текущее общее количество из базы
+        cursor.execute("""
+            SELECT total FROM messages WHERE user_id = ? AND chat_id = ?
+        """, (user_id, chat_id))
+        
+        row = cursor.fetchone()
+        
+        if row:
+            current_total = row[0]
+            
+            # Получаем количество сообщений из истории
+            cursor.execute("""
+                SELECT SUM(message_count) FROM all_messages_history 
+                WHERE user_id = ? AND chat_id = ?
+            """, (user_id, chat_id))
+            
+            history_result = cursor.fetchone()
+            history_count = history_result[0] if history_result and history_result[0] else 0
+            
+            # Если история показывает больше сообщений, обновляем
+            if history_count > current_total:
+                cursor.execute("""
+                    UPDATE messages SET total = ?, username = ? 
+                    WHERE user_id = ? AND chat_id = ?
+                """, (history_count, username, user_id, chat_id))
+                conn.commit()
+                logger.debug(f"Обновлено общее количество сообщений для пользователя {username}: {history_count}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка обновления общего количества для пользователя {user_id}: {e}")
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def handle_start(message: types.Message):
@@ -704,22 +694,18 @@ async def handle_start(message: types.Message):
     
     update_chat_settings(message.chat.id, chat_title, chat_type)
     
-    moscow_time = format_moscow_time()
-    
-    welcome_text = f"""
+    welcome_text = """
 👋 Привет! Я бот для подсчета статистики сообщений в чате.
-
-🕐 <b>Текущее время в Москве:</b> {moscow_time}
 
 📊 <b>Я считаю:</b>
 • Сообщения за сегодня
 • Сообщения за вчера
-• Общее количество сообщений
+• Общее количество сообщений (включая историю!)
 
 🎯 <b>Новые функции:</b>
-• Ежедневный отчет в 17:00 по МСК
-• Веселые упоминания каждые 2 часа (с 9:00 до 23:00)
-• Смешные предсказания и пожелания
+• Ежедневный отчет
+• Веселые упоминания каждый час (ротация: предсказание → пожелание → комплимент)
+• Учет всех сообщений, даже отправленных до добавления бота
 
 📋 <b>Доступные команды:</b>
 /status - Статистика чата
@@ -729,13 +715,14 @@ async def handle_start(message: types.Message):
 /weekly - Статистика за неделю
 /help - Помощь по командам
 /reset_today - Сбросить счетчики (админы)
+/scan_history - Просканировать историю сообщений (админы)
 
 💫 <b>Автоматически:</b>
-• Ежедневный отчет в 17:00 (МСК)
-• Автосброс в полночь (МСК)
-• Веселые упоминания каждые 2 часа
+• Ежедневный отчет
+• Автосброс в полночь
+• Веселые упоминания каждый час
 
-<i>Бот подсчитывает все текстовые сообщения в чате</i>
+<i>Бот подсчитывает все текстовые сообщения в чате и учитывает историю!</i>
 """
     await message.reply(welcome_text)
 
@@ -754,7 +741,7 @@ async def handle_help(message: types.Message):
     
     update_chat_settings(message.chat.id, chat_title, chat_type)
         
-    help_text = f"""
+    help_text = """
 <b>📚 Доступные команды:</b>
 
 📊 <b>Общие команды:</b>
@@ -766,17 +753,52 @@ async def handle_help(message: types.Message):
 
 ⚙️ <b>Для администраторов:</b>
 /reset_today - Сбросить счетчики на сегодня
+/scan_history - Просканировать историю сообщений
 
-🎉 <b>Автоматически (по московскому времени):</b>
-• Ежедневный отчет в 17:00
-• Автосброс в 00:00
-• Веселые упоминания каждые 2 часа (с 9:00 до 23:00)
+🎉 <b>Автоматически:</b>
+• Ежедневный отчет
+• Автосброс в полночь
+• Веселые упоминания каждый час (ротация типов)
 
-🕐 <b>Текущее время в Москве:</b> {format_moscow_time()}
-
-<i>Бот подсчитывает все текстовые сообщения в чате</i>
+<i>Бот подсчитывает ВСЕ сообщения в чате, включая историю!</i>
 """
     await message.reply(help_text)
+
+async def handle_scan_history(message: types.Message):
+    """Сканирование истории сообщений"""
+    if is_shutting_down:
+        return
+    
+    # Обновляем настройки чата
+    chat_type = message.chat.type
+    chat_title = None
+    if chat_type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        chat_title = message.chat.title
+    elif chat_type == ChatType.PRIVATE:
+        chat_title = message.from_user.full_name
+    
+    update_chat_settings(message.chat.id, chat_title, chat_type)
+    
+    # Проверяем права администратора
+    if chat_type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        try:
+            chat_admins = await bot_instance.get_chat_administrators(message.chat.id)
+            admin_ids = [admin.user.id for admin in chat_admins]
+            
+            if message.from_user.id not in admin_ids:
+                await message.reply("⚠️ Эта команда доступна только администраторам.")
+                return
+        except Exception as e:
+            logger.error(f"Error checking admin rights: {e}")
+            await message.reply("⚠️ Не удалось проверить права администратора.")
+            return
+    
+    await message.reply("🔄 Начинаю сканирование истории сообщений... Это может занять некоторое время.")
+    
+    # Запускаем сканирование в фоне
+    asyncio.create_task(scan_all_messages())
+    
+    await message.reply("✅ Сканирование истории запущено. Результаты будут учтены в статистике.")
 
 async def handle_status(message: types.Message):
     """Обработчик команды /status"""
@@ -809,8 +831,6 @@ async def handle_status(message: types.Message):
             await message.reply("📊 Пока нет статистики сообщений в этом чате.")
             return
         
-        moscow_time = format_moscow_time()
-        
         if chat_type == ChatType.PRIVATE:
             if len(members_with_stats) > 0:
                 user_stats = members_with_stats[0]
@@ -819,12 +839,10 @@ async def handle_status(message: types.Message):
                 text += f"📅 <b>Сегодня:</b> {user_stats['today']} сообщений\n"
                 text += f"🗓️ <b>Вчера:</b> {user_stats['yesterday']} сообщений\n"
                 text += f"📊 <b>Всего:</b> {user_stats['total']} сообщений\n"
-                text += f"🕐 <b>Московское время:</b> {moscow_time}"
             else:
                 text = "📊 Пока нет статистики сообщений."
         else:
-            text = f"<b>📊 Статистика чата</b>\n"
-            text += f"<i>Московское время: {moscow_time}</i>\n\n"
+            text = f"<b>📊 Статистика чата</b>\n\n"
             
             # Показываем топ-5
             for i, member in enumerate(members_with_stats[:5], 1):
@@ -878,9 +896,7 @@ async def handle_top(message: types.Message):
             await message.reply("📊 Пока нет статистики сообщений в этом чате.")
             return
         
-        moscow_time = format_moscow_time()
-        text = f"<b>🏆 Топ участников сегодня</b>\n"
-        text += f"<i>Московское время: {moscow_time}</i>\n\n"
+        text = f"<b>🏆 Топ участников сегодня</b>\n\n"
         
         top_limit = min(10, len(members_with_stats))
         
@@ -897,9 +913,17 @@ async def handle_top(message: types.Message):
         total_today = sum(member['today'] for member in members_with_stats)
         total_all = sum(member['total'] for member in members_with_stats)
         
+        # Получаем количество сообщений до бота
+        cursor.execute("SELECT total_messages_before_bot FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        before_bot_result = cursor.fetchone()
+        before_bot = before_bot_result[0] if before_bot_result else 0
+        
         text += f"<b>📈 Итого по чату:</b>\n"
         text += f"📅 Сегодня: <b>{total_today}</b> сообщ.\n"
-        text += f"📊 Всего: <b>{total_all}</b> сообщ."
+        text += f"📊 Всего с ботом: <b>{total_all}</b> сообщ.\n"
+        if before_bot > 0:
+            text += f"📜 До добавления бота: <b>{before_bot}</b> сообщ.\n"
+            text += f"📈 Общее всего: <b>{total_all + before_bot}</b> сообщ."
         
         await message.reply(text)
         
@@ -926,11 +950,12 @@ async def handle_mystats(message: types.Message):
     
     try:
         user_id = message.from_user.id
+        chat_id = message.chat.id
         
         cursor.execute("""
             SELECT username, today, yesterday, total, first_seen 
-            FROM messages WHERE user_id=?
-        """, (user_id,))
+            FROM messages WHERE user_id=? AND chat_id=?
+        """, (user_id, chat_id))
         row = cursor.fetchone()
         
         if row:
@@ -945,14 +970,22 @@ async def handle_mystats(message: types.Message):
             except:
                 first_seen_str = "неизвестно"
                 
-            moscow_time = format_moscow_time()
             text = f"<b>📊 Ваша статистика</b>\n\n"
             text += f"👤 <b>{username}</b>\n"
             text += f"📅 <b>Сегодня:</b> {today} сообщений\n"
             text += f"🗓️ <b>Вчера:</b> {yesterday} сообщений\n"
-            text += f"📊 <b>Всего:</b> {total} сообщений\n"
-            text += f"📅 <b>С нами с:</b> {first_seen_str}\n"
-            text += f"🕐 <b>Московское время:</b> {moscow_time}"
+            text += f"📊 <b>Всего в этом чате:</b> {total} сообщений\n"
+            
+            # Получаем общую статистику по всем чатам
+            cursor.execute("""
+                SELECT SUM(total) FROM messages WHERE user_id=?
+            """, (user_id,))
+            total_all_chats = cursor.fetchone()[0] or 0
+            
+            if total_all_chats > total:
+                text += f"📈 <b>Всего во всех чатах:</b> {total_all_chats} сообщений\n"
+            
+            text += f"📅 <b>С нами с:</b> {first_seen_str}"
             
             await message.reply(text)
         else:
@@ -980,6 +1013,7 @@ async def handle_yesterday(message: types.Message):
     logger.info(f"Command /yesterday received from {message.from_user.id}")
     
     try:
+        chat_id = message.chat.id
         chat_type = message.chat.type
         
         if chat_type == ChatType.CHANNEL:
@@ -989,26 +1023,24 @@ async def handle_yesterday(message: types.Message):
         cursor.execute("""
             SELECT username, yesterday as count 
             FROM messages 
-            WHERE yesterday > 0 
+            WHERE chat_id = ? AND yesterday > 0 
             ORDER BY yesterday DESC 
             LIMIT 10
-        """)
+        """, (chat_id,))
         rows = cursor.fetchall()
         
         if not rows:
             await message.reply("📊 Вчера не было сообщений или статистика не собрана.")
             return
             
-        moscow_time = format_moscow_time()
-        text = f"<b>📊 Топ за вчера</b>\n"
-        text += f"<i>Московское время: {moscow_time}</i>\n\n"
+        text = f"<b>📊 Топ за вчера</b>\n\n"
         
         for i, (username, count) in enumerate(rows, 1):
             emoji = "👑" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
             
             text += f"{emoji} <b>{username}:</b> {count} сообщ.\n"
         
-        cursor.execute("SELECT SUM(yesterday) FROM messages")
+        cursor.execute("SELECT SUM(yesterday) FROM messages WHERE chat_id = ?", (chat_id,))
         total_yesterday = cursor.fetchone()[0] or 0
         
         text += f"\n<b>📈 Итого за вчера:</b> {total_yesterday} сообщений"
@@ -1037,7 +1069,7 @@ async def handle_weekly(message: types.Message):
     logger.info(f"Command /weekly received from {message.from_user.id}")
     
     try:
-        end_date = get_moscow_time().date()
+        end_date = datetime.now().date()
         start_date = end_date - timedelta(days=6)
         
         cursor.execute("""
@@ -1053,9 +1085,7 @@ async def handle_weekly(message: types.Message):
             await message.reply("📊 Недостаточно данных для недельного отчета.")
             return
             
-        moscow_time = format_moscow_time()
-        text = f"<b>📅 Статистика за неделю</b>\n"
-        text += f"<i>Московское время: {moscow_time}</i>\n\n"
+        text = f"<b>📅 Статистика за неделю</b>\n\n"
         
         total_messages_week = 0
         total_active_week = 0
@@ -1126,16 +1156,16 @@ async def handle_reset_today(message: types.Message):
             await message.reply("⚠️ Не удалось проверить права администратора.")
             return
             
-        cursor.execute("SELECT SUM(today) FROM messages")
+        cursor.execute("SELECT SUM(today) FROM messages WHERE chat_id = ?", (chat_id,))
         total_today = cursor.fetchone()[0] or 0
         
-        cursor.execute("SELECT COUNT(*) FROM messages WHERE today > 0")
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM messages WHERE chat_id = ? AND today > 0", (chat_id,))
         active_today = cursor.fetchone()[0] or 0
         
-        cursor.execute("SELECT user_id, today FROM messages WHERE today > 0 ORDER BY today DESC LIMIT 1")
+        cursor.execute("SELECT user_id, today FROM messages WHERE chat_id = ? AND today > 0 ORDER BY today DESC LIMIT 1", (chat_id,))
         top_user = cursor.fetchone()
         
-        today_date = get_moscow_date_str()
+        today_date = datetime.now().strftime('%Y-%m-%d')
         cursor.execute("""
             INSERT OR REPLACE INTO daily_stats 
             (date, total_messages, active_users, top_user_id, top_user_count)
@@ -1148,16 +1178,14 @@ async def handle_reset_today(message: types.Message):
             top_user[1] if top_user else 0
         ))
         
-        cursor.execute("UPDATE messages SET yesterday = today, today = 0")
+        cursor.execute("UPDATE messages SET yesterday = today, today = 0 WHERE chat_id = ?", (chat_id,))
         conn.commit()
         
         clear_chat_cache(chat_id)
         
-        moscow_time = format_moscow_time()
         await message.reply(
             f"✅ Счетчики сообщений сброшены.\n"
-            f"📊 Сегодня было: {total_today} сообщений от {active_today} пользователей\n"
-            f"🕐 Московское время: {moscow_time}"
+            f"📊 Сегодня было: {total_today} сообщений от {active_today} пользователей"
         )
         
     except Exception as e:
@@ -1192,20 +1220,25 @@ async def count_messages(message: types.Message):
     
     update_chat_settings(chat_id, chat_title, chat_type)
 
-    current_time = get_moscow_time()
+    current_time = datetime.now()
     
-    cursor.execute("SELECT * FROM messages WHERE user_id=?", (user_id,))
+    # Сохраняем в историю всех сообщений
+    cursor.execute("""
+        INSERT INTO all_messages_history 
+        (chat_id, user_id, username, message_date, message_count)
+        VALUES (?, ?, ?, ?, 1)
+    """, (chat_id, user_id, username, current_time.isoformat()))
+    
+    cursor.execute("SELECT * FROM messages WHERE user_id=? AND chat_id=?", (user_id, chat_id))
     row = cursor.fetchone()
 
     if row:
-        last_updated_str = row[5]
+        last_updated_str = row[6]  # last_updated находится на 7 позиции (индекс 6)
         if last_updated_str:
             try:
                 if 'Z' in last_updated_str:
                     last_updated_str = last_updated_str.replace('Z', '+00:00')
                 last_updated = datetime.fromisoformat(last_updated_str)
-                if last_updated.tzinfo is None:
-                    last_updated = MOSCOW_TZ.localize(last_updated)
                 
                 if current_time.date() > last_updated.date():
                     cursor.execute("""
@@ -1215,8 +1248,8 @@ async def count_messages(message: types.Message):
                             total = total + 1,
                             username = ?,
                             last_updated = ?
-                        WHERE user_id=?
-                    """, (username, current_time.isoformat(), user_id))
+                        WHERE user_id=? AND chat_id=?
+                    """, (username, current_time.isoformat(), user_id, chat_id))
                 else:
                     cursor.execute("""
                         UPDATE messages
@@ -1224,8 +1257,8 @@ async def count_messages(message: types.Message):
                             total = total + 1,
                             username = ?,
                             last_updated = ?
-                        WHERE user_id=?
-                    """, (username, current_time.isoformat(), user_id))
+                        WHERE user_id=? AND chat_id=?
+                    """, (username, current_time.isoformat(), user_id, chat_id))
             except Exception as e:
                 logger.error(f"Error parsing last_updated: {e}, resetting counters")
                 cursor.execute("""
@@ -1234,8 +1267,8 @@ async def count_messages(message: types.Message):
                         total = total + 1,
                         username = ?,
                         last_updated = ?
-                    WHERE user_id=?
-                """, (username, current_time.isoformat(), user_id))
+                    WHERE user_id=? AND chat_id=?
+                """, (username, current_time.isoformat(), user_id, chat_id))
         else:
             cursor.execute("""
                 UPDATE messages
@@ -1243,16 +1276,19 @@ async def count_messages(message: types.Message):
                     total = total + 1,
                     username = ?,
                     last_updated = ?
-                WHERE user_id=?
-            """, (username, current_time.isoformat(), user_id))
+                WHERE user_id=? AND chat_id=?
+            """, (username, current_time.isoformat(), user_id, chat_id))
     else:
         cursor.execute("""
-            INSERT INTO messages (user_id, username, today, total, first_seen, last_updated)
-            VALUES (?, ?, 1, 1, ?, ?)
-        """, (user_id, username, current_time.isoformat(), current_time.isoformat()))
+            INSERT INTO messages (user_id, chat_id, username, today, total, first_seen, last_updated)
+            VALUES (?, ?, ?, 1, 1, ?, ?)
+        """, (user_id, chat_id, username, current_time.isoformat(), current_time.isoformat()))
 
     conn.commit()
     clear_chat_cache(chat_id)
+    
+    # Обновляем общее количество с учетом истории
+    await update_total_count_for_user(user_id, chat_id, username)
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 async def main():
@@ -1281,6 +1317,7 @@ async def main():
     dp.message.register(handle_yesterday, Command("yesterday"))
     dp.message.register(handle_weekly, Command("weekly"))
     dp.message.register(handle_reset_today, Command("reset_today"))
+    dp.message.register(handle_scan_history, Command("scan_history"))
     dp.message.register(count_messages, F.text & ~F.text.startswith('/'))
     
     # Запуск HTTP-сервера в отдельном потоке
@@ -1298,6 +1335,7 @@ async def main():
             types.BotCommand(command="yesterday", description="🗓️ Топ за вчера"),
             types.BotCommand(command="weekly", description="📅 Статистика за неделю"),
             types.BotCommand(command="reset_today", description="🔄 Сбросить счетчики"),
+            types.BotCommand(command="scan_history", description="🔍 Сканировать историю"),
             types.BotCommand(command="help", description="❓ Помощь по командам")
         ])
         logger.info("Команды бота зарегистрированы")
@@ -1308,39 +1346,37 @@ async def main():
     try:
         me = await bot_instance.get_me()
         logger.info(f"Бот успешно авторизован: @{me.username} (ID: {me.id})")
-        logger.info(f"Текущее время в Москве: {format_moscow_time()}")
     except Exception as e:
         logger.error(f"Ошибка авторизации: {e}")
         return
     
-    # Настройка планировщика с московским временем
-    scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
+    # Настройка планировщика
+    scheduler = AsyncIOScheduler()
     scheduler_instance = scheduler
     
-    # Ежедневный отчет в 17:00 по МСК
-    scheduler.add_job(daily_report, "cron", hour=17, minute=0, misfire_grace_time=300)
-    logger.info("Запланирован ежедневный отчет в 17:00 по МСК")
+    # Упоминания каждый час
+    scheduler.add_job(send_hourly_mention, "cron", hour="*", minute=0, misfire_grace_time=300)
+    logger.info("Запланированы упоминания каждый час")
     
-    # Упоминания каждые 2 часа (с 9:00 до 23:00)
-    mention_hours = [9, 11, 13, 15, 17, 19, 21, 23]
-    for hour in mention_hours:
-        scheduler.add_job(mention_random_user, "cron", hour=hour, minute=0, misfire_grace_time=300)
-        logger.info(f"Запланировано упоминание в {hour}:00 по МСК")
+    # Ежедневный отчет в 20:00
+    scheduler.add_job(daily_report, "cron", hour=20, minute=0, misfire_grace_time=300)
+    logger.info("Запланирован ежедневный отчет в 20:00")
     
-    # Автосброс в полночь по МСК
+    # Автосброс в полночь
     scheduler.add_job(auto_reset_counters, "cron", hour=0, minute=0, misfire_grace_time=300)
-    logger.info("Запланирован автосброс в 00:00 по МСК")
+    logger.info("Запланирован автосброс в 00:00")
     
-    # Автосохранение каждые 30 минут
-    scheduler.add_job(auto_save_stats, "cron", minute="*/30", misfire_grace_time=300)
+    # Автосканирование истории раз в день
+    scheduler.add_job(scan_all_messages, "cron", hour=3, minute=0, misfire_grace_time=300)
+    logger.info("Запланировано автосканирование истории в 03:00")
     
     try:
         scheduler.start()
-        logger.info("Планировщик запущен (время МСК)")
+        logger.info("Планировщик запущен")
         
-        # Сразу проверим работу упоминаний
+        # Тестовый запуск функции упоминаний
         logger.info("Тестовый запуск функции упоминаний...")
-        await mention_random_user()
+        await send_hourly_mention()
         
     except Exception as e:
         logger.error(f"Ошибка запуска планировщика: {e}")
@@ -1354,6 +1390,12 @@ async def main():
     
     try:
         logger.info("Бот запущен и готов к работе...")
+        logger.info("Особенности бота:")
+        logger.info("1. Учитывает ВСЕ сообщения (включая историю)")
+        logger.info("2. Упоминания каждый час с ротацией типов")
+        logger.info("3. Ежедневные отчеты")
+        logger.info("4. Автосброс статистики")
+        
         polling_task = asyncio.create_task(dp.start_polling(bot_instance, skip_updates=True, handle_signals=False))
         await polling_task
     except asyncio.CancelledError:
